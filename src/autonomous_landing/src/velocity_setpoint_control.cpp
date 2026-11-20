@@ -20,6 +20,7 @@
 #include <cmath>
 #include <vector>
 #include <limits>
+#include <algorithm>
 
 using namespace std::chrono;
 using namespace std::chrono_literals;
@@ -46,6 +47,10 @@ public:
 			current_pos_ = {msg->x, msg->y, msg->z};
 			position_valid_ = msg->xy_valid && msg->z_valid;
 		});
+
+		if (!position_valid_) {
+			current_pos_ = {0.0f, 0.0f, 0.0f};
+		}
 
 		waypoints_ = {
 			{0.0f, 0.0f, -5.0f},
@@ -181,12 +186,22 @@ void VelocitySetpointControl::publish_offboard_control_mode()
  *        For this example, it sends a trajectory setpoint to make the
  *        vehicle hover at 5 meters with a yaw angle of 180 degrees.
  */
-void VelocitySetpointControl::publish_trajectory_setpoint(const std::array<float, 3> &v)
+void VelocitySetpointControl::publish_trajectory_setpoint(const std::array<float, 3> &p)
 {	
 	const float nan = std::numeric_limits<float>::quiet_NaN();
+	const float kKp = 1.5;
+	const float kV_max = 4.0;
+	float pos_error_x = p[0] - current_pos_[0];
+	float pos_error_y = p[1] - current_pos_[1];
+	float pos_error_z = p[2] - current_pos_[2];
+	
+	std::array<float, 3> v_sp{std::clamp(kKp * (pos_error_x), -kV_max, kV_max),  std::clamp(kKp * (pos_error_y), -kV_max, kV_max), std::clamp(kKp * (pos_error_z), -kV_max, kV_max)};
+	float n = std::sqrt(v_sp[0]*v_sp[0] + v_sp[1]*v_sp[1] + v_sp[2]*v_sp[2]);
+	if (n > kV_max) for (auto &elem : v_sp) elem *= kV_max / n;
+	
 	TrajectorySetpoint msg{};
 	msg.position = {nan, nan, nan};
-	msg.velocity = {v[0], v[1], v[2]};
+	msg.velocity = {v_sp[0], v_sp[1], v_sp[2]};
 	msg.yaw = 3.14; // [-PI:PI]
 	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
 	trajectory_setpoint_publisher_->publish(msg);
