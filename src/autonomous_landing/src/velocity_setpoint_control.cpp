@@ -45,6 +45,8 @@ public:
 
 		local_position_subscriber_ = this->create_subscription<VehicleLocalPosition>("/fmu/out/vehicle_local_position", qos, [this](const VehicleLocalPosition::UniquePtr msg) {
 			current_pos_ = {msg->x, msg->y, msg->z};
+			current_vel_ = {msg->vx, msg->vy, msg->vz};
+			current_yaw_ = msg->heading;
 			position_valid_ = msg->xy_valid && msg->z_valid;
 		});
 
@@ -115,10 +117,14 @@ private:
 	static constexpr float kAcceptanceRadius = 0.3f; 
 	
 	rclcpp::TimerBase::SharedPtr timer_;
+	uint_fast64_t last_us_{0};
 
 	rclcpp::Subscription<VehicleLocalPosition>::SharedPtr local_position_subscriber_;
 	std::vector<std::array<float, 3>> waypoints_;
 	std::array<float, 3> current_pos_{0, 0, 0};
+	std::array<float, 3> current_vel_{0, 0, 0};
+	float current_yaw_{0};
+	float yaw_sp_{NAN};
 	size_t wp_index_{0};
 	int hold_ticks_{0};
 	bool position_valid_{false};
@@ -127,8 +133,6 @@ private:
 	rclcpp::Publisher<OffboardControlMode>::SharedPtr offboard_control_mode_publisher_;
 	rclcpp::Publisher<TrajectorySetpoint>::SharedPtr trajectory_setpoint_publisher_;
 	rclcpp::Publisher<VehicleCommand>::SharedPtr vehicle_command_publisher_;
-
-	std::atomic<uint64_t> timestamp_;   //!< common synced timestamped
 
 	uint64_t offboard_setpoint_counter_;   //!< counter for the number of setpoints sent
 
@@ -142,7 +146,7 @@ bool VelocitySetpointControl::reached(const std::array<float, 3> &wp) const {
 	float dx = wp[0] - current_pos_[0];
 	float dy = wp[1] - current_pos_[1];
 	float dz = wp[2] - current_pos_[2];
-	return std::sqrt(dx*dx + dy*dy + dz*dz) < kAcceptanceRadius;
+	return std::hypot(dx, dy, dz) < kAcceptanceRadius;
 }
 
 /**
@@ -188,22 +192,40 @@ void VelocitySetpointControl::publish_offboard_control_mode()
  */
 void VelocitySetpointControl::publish_trajectory_setpoint(const std::array<float, 3> &p)
 {	
+	const uint64_t now_us = this->get_clock()->now().nanoseconds() / 1000;
+	float dt = (last_us_ == 0) ? 0.1f : static_cast<float>(now_us - last_us_) * 1e-6f;
+	dt = std::clamp(dt, 0.001f, 0.5f);
 	const float nan = std::numeric_limits<float>::quiet_NaN();
 	const float kKp = 1.5;
+	const float kKi = 1.0;
+	const float kKd = 0.3;
 	const float kV_max = 4.0;
 	float pos_error_x = p[0] - current_pos_[0];
 	float pos_error_y = p[1] - current_pos_[1];
 	float pos_error_z = p[2] - current_pos_[2];
+	const float horiz_dist = std::hypot(pos_error_x, pos_error_y);
 	
-	std::array<float, 3> v_sp{std::clamp(kKp * (pos_error_x), -kV_max, kV_max),  std::clamp(kKp * (pos_error_y), -kV_max, kV_max), std::clamp(kKp * (pos_error_z), -kV_max, kV_max)};
-	float n = std::sqrt(v_sp[0]*v_sp[0] + v_sp[1]*v_sp[1] + v_sp[2]*v_sp[2]);
+	float v_sp_x = kKp * (pos_error_x) + kKd * (-current_vel_[0]);
+	float v_sp_y = kKp * (pos_error_y) + kKd * (-current_vel_[1]);
+	float v_sp_z = kKp * (pos_error_z) + kKd * (-current_vel_[2]);
+
+	last_us_ = now_us;
+	// Calculate velocity control output
+	std::array<float, 3> v_sp{std::clamp(v_sp_x, -kV_max, kV_max),  std::clamp(v_sp_y, -kV_max, kV_max), std::clamp(v_sp_z, -kV_max, kV_max)};
+	
+	if (horiz_dist > 0.5f || std::isnan(yaw_sp_)) {
+		yaw_sp_ = std::atan2(pos_error_y, pos_error_x);
+	}
+	
+	// clampe the velocity control output
+	float n = std::hypot(v_sp[0], v_sp[1], v_sp[2]);
 	if (n > kV_max) for (auto &elem : v_sp) elem *= kV_max / n;
 	
 	TrajectorySetpoint msg{};
 	msg.position = {nan, nan, nan};
 	msg.velocity = {v_sp[0], v_sp[1], v_sp[2]};
-	msg.yaw = 3.14; // [-PI:PI]
-	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
+	msg.yaw = std::isnan(yaw_sp_) ? current_yaw_ : yaw_sp_;
+	msg.timestamp = now_us;
 	trajectory_setpoint_publisher_->publish(msg);
 }
 
