@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.8)
 project(autonomous_landing)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -10,6 +11,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(px4_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(Eigen3 REQUIRED NO_MODULE)
 
 add_executable(velocity_setpoint_control src/velocity_setpoint_control.cpp)
 target_include_directories(velocity_setpoint_control PUBLIC
@@ -21,7 +23,8 @@ ament_target_dependencies(
   "rclcpp"
   "px4_msgs"
   "geometry_msgs"
-)
+  )
+target_link_libraries(velocity_setpoint_control Eigen3::Eigen)
 
 install(TARGETS velocity_setpoint_control
   DESTINATION lib/${PROJECT_NAME})

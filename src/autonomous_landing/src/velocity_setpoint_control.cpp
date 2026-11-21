@@ -12,6 +12,7 @@
 #include <px4_msgs/msg/vehicle_control_mode.hpp>
 #include <px4_msgs/msg/vehicle_local_position.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <eigen3/Eigen/Dense>
 #include <stdint.h>
 
 #include <chrono>
@@ -56,9 +57,9 @@ public:
 
 		waypoints_ = {
 			{0.0f, 0.0f, -5.0f},
-			{5.0f, 0.0f, -5.0f},
-			{5.0f, 5.0f, -5.0f},
-			{0.0f, 5.0f, -5.0f},
+			{20.0f, 0.0f, -5.0f},
+			{20.0f, 20.0f, -5.0f},
+			{0.0f, 20.0f, -5.0f},
 			{0.0f, 0.0f, -5.0f},
 		};
 
@@ -76,7 +77,7 @@ public:
 				this->publish_vehicle_command(VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6);
 
 				// Arm the vehicle
-				this->arm();
+				if (position_valid_) this->arm();
 			}
 
 			// offboard_control_mode needs to be paired with trajectory_setpoint
@@ -94,6 +95,7 @@ public:
 					hold_ticks_ = 0;
 					if (wp_index_ + 1 < waypoints_.size()) {
 						wp_index_++;
+						cumulated_err_.fill(0.0f); // Reset the integral error to 0 when arrive at wp to prevent windup
 						RCLCPP_INFO(get_logger(), "Waypoint reached -> going to %zu", wp_index_);
 					} else if (!mission_done_) {
 						mission_done_ = true;
@@ -121,10 +123,11 @@ private:
 
 	rclcpp::Subscription<VehicleLocalPosition>::SharedPtr local_position_subscriber_;
 	std::vector<std::array<float, 3>> waypoints_;
-	std::array<float, 3> current_pos_{0, 0, 0};
-	std::array<float, 3> current_vel_{0, 0, 0};
-	float current_yaw_{0};
+	std::array<float, 3> current_pos_{0.0f, 0.0f, 0.0f};
+	std::array<float, 3> current_vel_{0.0f, 0.0f, 0.0f};
+	float current_yaw_{0.0f};
 	float yaw_sp_{NAN};
+	std::array<float, 3> cumulated_err_{0.0f, 0.0f, 0.0f};
 	size_t wp_index_{0};
 	int hold_ticks_{0};
 	bool position_valid_{false};
@@ -190,36 +193,51 @@ void VelocitySetpointControl::publish_offboard_control_mode()
  *        For this example, it sends a trajectory setpoint to make the
  *        vehicle hover at 5 meters with a yaw angle of 180 degrees.
  */
-void VelocitySetpointControl::publish_trajectory_setpoint(const std::array<float, 3> &p)
-{	
+void VelocitySetpointControl::publish_trajectory_setpoint(const std::array<float, 3> &wp)
+{		
 	const uint64_t now_us = this->get_clock()->now().nanoseconds() / 1000;
 	float dt = (last_us_ == 0) ? 0.1f : static_cast<float>(now_us - last_us_) * 1e-6f;
 	dt = std::clamp(dt, 0.001f, 0.5f);
 	const float nan = std::numeric_limits<float>::quiet_NaN();
-	const float kKp = 1.5;
-	const float kKi = 1.0;
-	const float kKd = 0.3;
-	const float kV_max = 4.0;
-	float pos_error_x = p[0] - current_pos_[0];
-	float pos_error_y = p[1] - current_pos_[1];
-	float pos_error_z = p[2] - current_pos_[2];
-	const float horiz_dist = std::hypot(pos_error_x, pos_error_y);
+	static constexpr float kKp = 2.8f;
+	static constexpr float kKi = 0.1f;
+	static constexpr float kKd = 1.5f;
+	static constexpr float kV_max = 4.0f;
+	static constexpr float kI_max = 0.5f;
+	const std::array<float ,3> err{wp[0] - current_pos_[0], wp[1] - current_pos_[1], wp[2] - current_pos_[2]};
 	
-	float v_sp_x = kKp * (pos_error_x) + kKd * (-current_vel_[0]);
-	float v_sp_y = kKp * (pos_error_y) + kKd * (-current_vel_[1]);
-	float v_sp_z = kKp * (pos_error_z) + kKd * (-current_vel_[2]);
+	std::array<float, 3> v_raw;
+	
+	// Calculate PID control outputs
+	for (int i = 0; i < 3; ++i) {
+		v_raw[i] = kKp * err[i] + std::clamp(kKi * cumulated_err_[i], -kI_max, kI_max) + kKd * (-current_vel_[i]);
+	}
+	std::array<float, 3> v_sp = v_raw;
+	const float n = std::hypot(v_raw[0], v_raw[1], v_raw[2]);
+	
+	// Clamp the velocity control output if saturated (v > v_max)
+	const bool saturated = n > kV_max;
+	if (saturated) {
+		RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 1000, "v_sp saturated: |v_ra|=%.2f > %.2f", n, kV_max);
+		for (auto &elem : v_sp) elem *= kV_max / n;
+	}
+
+	// Stop integrating while saturation and moving
+	for (int i = 0; i < 3; ++i) {
+		const bool pushes_further = saturated && (err[i] * v_raw[i] > 0.0f);
+		if (!pushes_further) {
+			cumulated_err_[i] += err[i] * dt;
+		}
+	}
+
+	const float horiz_dist = std::hypot(err[0], err[1]);
 
 	last_us_ = now_us;
-	// Calculate velocity control output
-	std::array<float, 3> v_sp{std::clamp(v_sp_x, -kV_max, kV_max),  std::clamp(v_sp_y, -kV_max, kV_max), std::clamp(v_sp_z, -kV_max, kV_max)};
 	
 	if (horiz_dist > 0.5f || std::isnan(yaw_sp_)) {
-		yaw_sp_ = std::atan2(pos_error_y, pos_error_x);
+		yaw_sp_ = std::atan2(err[1], err[0]);
 	}
 	
-	// clampe the velocity control output
-	float n = std::hypot(v_sp[0], v_sp[1], v_sp[2]);
-	if (n > kV_max) for (auto &elem : v_sp) elem *= kV_max / n;
 	
 	TrajectorySetpoint msg{};
 	msg.position = {nan, nan, nan};
