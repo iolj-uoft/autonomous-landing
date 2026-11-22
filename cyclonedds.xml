@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- Large receive buffer so full-size camera images (several MB each) aren't dropped.
+     Use with:  export CYCLONEDDS_URI=file://$HOME/ws_autonomous_landing/cyclonedds.xml
+     Also requires:  sudo sysctl -w net.core.rmem_max=2147483647 -->
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain Id="any">
+    <Internal>
+      <SocketReceiveBufferSize min="10MB"/>
+    </Internal>
+  </Domain>
+</CycloneDDS>

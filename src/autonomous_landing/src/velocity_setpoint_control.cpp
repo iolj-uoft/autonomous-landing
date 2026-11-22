@@ -1,181 +1,168 @@
-/**
- * @brief Offboard control example
- * @file offboard_control.cpp
- * @addtogroup examples
- * @author Mickey Cowden <info@cowden.tech>
- * @author Nuno Marques <nuno.marques@dronesolutions.io>
- */
+#include "autonomous_landing/velocity_setpoint_control.hpp"
 
-#include <px4_msgs/msg/offboard_control_mode.hpp>
-#include <px4_msgs/msg/trajectory_setpoint.hpp>
-#include <px4_msgs/msg/vehicle_command.hpp>
-#include <px4_msgs/msg/vehicle_control_mode.hpp>
-#include <px4_msgs/msg/vehicle_local_position.hpp>
-#include <rclcpp/rclcpp.hpp>
-#include <eigen3/Eigen/Dense>
-#include <stdint.h>
-
-#include <chrono>
-#include <iostream>
-#include <array>
-#include <cmath>
-#include <vector>
-#include <limits>
 #include <algorithm>
+#include <chrono>
+#include <limits>
 
-using namespace std::chrono;
 using namespace std::chrono_literals;
 using namespace px4_msgs::msg;
 
-class VelocitySetpointControl : public rclcpp::Node
+namespace autonomous_landing
 {
-public:
-	/**
-	 * @brief Construct the offboard_control node.
-	 *
-	 * Subscribes to the vehicle's local position, loads the square waypoint mission,
-	 * creates the offboard/trajectory/command publishers, and starts a 10 Hz timer that:
-	 *   - streams setpoints, switches to Offboard mode and arms after 10 setpoints,
-	 *   - advances to the next waypoint once it's held for ~1 s (10 ticks),
-	 *   - commands a land after the final waypoint.
-	 */
-	VelocitySetpointControl() : Node("velocity_setpoint_control")
-	{
-		rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
-		auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 5), qos_profile);
 
-		local_position_subscriber_ = this->create_subscription<VehicleLocalPosition>("/fmu/out/vehicle_local_position", qos, [this](const VehicleLocalPosition::UniquePtr msg) {
-			current_pos_ = {msg->x, msg->y, msg->z};
-			current_vel_ = {msg->vx, msg->vy, msg->vz};
-			current_yaw_ = msg->heading;
+VelocitySetpointControl::VelocitySetpointControl() : Node("velocity_setpoint_control")
+{
+	rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
+	auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, 5), qos_profile);
+
+	local_position_sub_ = create_subscription<VehicleLocalPosition>(
+		"/fmu/out/vehicle_local_position", qos,
+		[this](const VehicleLocalPosition::UniquePtr msg) {
+			pos_ = {msg->x, msg->y, msg->z};
+			vel_ = {msg->vx, msg->vy, msg->vz};
+			yaw_ = msg->heading;
 			position_valid_ = msg->xy_valid && msg->z_valid;
 		});
 
-		if (!position_valid_) {
-			current_pos_ = {0.0f, 0.0f, 0.0f};
-		}
+	// PX4 v1.14 doesn't bridge vehicle_land_detected; it auto-disarms after touchdown
+	// (COM_DISARM_LAND), so a disarm while in Landing means we're on the ground.
+	vehicle_status_sub_ = create_subscription<VehicleStatus>(
+		"/fmu/out/vehicle_status", qos,
+		[this](const VehicleStatus::UniquePtr msg) {
+			arming_state_ = msg->arming_state;
+		});
 
-		waypoints_ = {
-			{0.0f, 0.0f, -5.0f},
-			{20.0f, 0.0f, -5.0f},
-			{20.0f, 20.0f, -5.0f},
-			{0.0f, 20.0f, -5.0f},
-			{0.0f, 0.0f, -5.0f},
-		};
+	waypoints_ = {
+		{0.0f, 0.0f, -5.0f},
+		{20.0f, 0.0f, -5.0f},
+		{20.0f, 20.0f, -5.0f},
+		{0.0f, 20.0f, -5.0f},
+		{0.0f, 0.0f, -5.0f},
+	};
 
-		offboard_setpoint_counter_ = 0;
+	offboard_control_mode_pub_ = create_publisher<OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
+	trajectory_setpoint_pub_ = create_publisher<TrajectorySetpoint>("/fmu/in/trajectory_setpoint", 10);
+	vehicle_command_pub_ = create_publisher<VehicleCommand>("/fmu/in/vehicle_command", 10);
 
-		offboard_control_mode_publisher_ = this->create_publisher<OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
-		trajectory_setpoint_publisher_ = this->create_publisher<TrajectorySetpoint>("/fmu/in/trajectory_setpoint", 10);
-		vehicle_command_publisher_ = this->create_publisher<VehicleCommand>("/fmu/in/vehicle_command", 10);
+	timer_ = create_wall_timer(100ms, [this]() { on_timer(); });
+}
 
-		// timer_callback is a lambda function stored in a local var in constructor 
-		auto timer_callback = [this]() -> void {
-
-			if (offboard_setpoint_counter_ == 10) {
-				// Change to Offboard mode after 10 setpoints
-				this->publish_vehicle_command(VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6);
-
-				// Arm the vehicle
-				if (position_valid_) this->arm();
-			}
-
-			// offboard_control_mode needs to be paired with trajectory_setpoint
-			publish_offboard_control_mode();
-			publish_trajectory_setpoint(waypoints_[wp_index_]);
-
-			// stop the counter after reaching 11
-			if (offboard_setpoint_counter_ < 11) {
-				offboard_setpoint_counter_++;
-				return;
-			}
-
-			if (position_valid_ && reached(waypoints_[wp_index_])) {
-				if (++hold_ticks_ >= 10) {
-					hold_ticks_ = 0;
-					if (wp_index_ + 1 < waypoints_.size()) {
-						wp_index_++;
-						cumulated_err_.fill(0.0f); // Reset the integral error to 0 when arrive at wp to prevent windup
-						RCLCPP_INFO(get_logger(), "Waypoint reached -> going to %zu", wp_index_);
-					} else if (!mission_done_) {
-						mission_done_ = true;
-						RCLCPP_INFO(get_logger(), "Mission complete, landing!");
-						publish_vehicle_command(VehicleCommand::VEHICLE_CMD_NAV_LAND);
-					}
-				}
-			} else {
-				hold_ticks_ = 0;
-			}
-		};
-		timer_ = this->create_wall_timer(100ms, timer_callback);
+void VelocitySetpointControl::on_timer()
+{
+	// PX4 needs offboard_control_mode + trajectory_setpoint streamed continuously while in Offboard
+	if (phase_ != Phase::Landing && phase_ != Phase::Done && phase_ != Phase::Abort) {
+		publish_offboard_control_mode();
+		publish_velocity_setpoint(waypoints_[wp_index_]);
 	}
 
-	void arm();
-	void disarm();
-	bool reached(const std::array<float, 3> &wp) const;
+	switch (phase_) {
+		case Phase::WaitForEstimate:
+			if (position_valid_) {
+				transition_to(Phase::Prestream);
+			}
+			break;
 
+		case Phase::Prestream:
+			if (++prestream_count_ >= kPrestreamTicks) {
+				transition_to(Phase::Arming);
+			}
+			break;
 
-private:
-	static constexpr float kAcceptanceRadius = 0.3f; 
-	
-	rclcpp::TimerBase::SharedPtr timer_;
-	uint_fast64_t last_us_{0};
+		case Phase::Arming:
+			transition_to(Phase::Waypoints);
+			break;
 
-	rclcpp::Subscription<VehicleLocalPosition>::SharedPtr local_position_subscriber_;
-	std::vector<std::array<float, 3>> waypoints_;
-	std::array<float, 3> current_pos_{0.0f, 0.0f, 0.0f};
-	std::array<float, 3> current_vel_{0.0f, 0.0f, 0.0f};
-	float current_yaw_{0.0f};
-	float yaw_sp_{NAN};
-	std::array<float, 3> cumulated_err_{0.0f, 0.0f, 0.0f};
-	size_t wp_index_{0};
-	int hold_ticks_{0};
-	bool position_valid_{false};
-	bool mission_done_{false};
+		case Phase::Waypoints:
+			update_waypoints();
+			break;
 
-	rclcpp::Publisher<OffboardControlMode>::SharedPtr offboard_control_mode_publisher_;
-	rclcpp::Publisher<TrajectorySetpoint>::SharedPtr trajectory_setpoint_publisher_;
-	rclcpp::Publisher<VehicleCommand>::SharedPtr vehicle_command_publisher_;
+		case Phase::Landing:
+			if (arming_state_ == VehicleStatus::ARMING_STATE_STANDBY) {
+				transition_to(Phase::Done);
+			}
+			break;
 
-	uint64_t offboard_setpoint_counter_;   //!< counter for the number of setpoints sent
-
-	void publish_offboard_control_mode();
-	void publish_trajectory_setpoint(const std::array<float, 3> &p);
-	void publish_vehicle_command(uint16_t command, float param1 = 0.0, float param2 = 0.0);
-};
-
-// @brief Detect if the drone is in the radius of a waypoint
-bool VelocitySetpointControl::reached(const std::array<float, 3> &wp) const {
-	float dx = wp[0] - current_pos_[0];
-	float dy = wp[1] - current_pos_[1];
-	float dz = wp[2] - current_pos_[2];
-	return std::hypot(dx, dy, dz) < kAcceptanceRadius;
+		case Phase::Done:
+		case Phase::Abort:
+			break;
+	}
 }
 
-/**
- * @brief Send a command to Arm the vehicle
- */
+void VelocitySetpointControl::transition_to(Phase next)
+{
+	RCLCPP_INFO(get_logger(), "Phase: %s -> %s", to_str(phase_), to_str(next));
+	phase_ = next;
+
+	// One-shot actions on entering a phase
+	switch (next) {
+		case Phase::Arming:
+			publish_vehicle_command(VehicleCommand::VEHICLE_CMD_DO_SET_MODE, 1, 6);  // Offboard
+			arm();
+			break;
+
+		case Phase::Waypoints:
+			// Discard the integral built up while sitting on the ground
+			pid_.reset_integral_error();
+			hold_ticks_ = 0;
+			break;
+
+		case Phase::Landing:
+			publish_vehicle_command(VehicleCommand::VEHICLE_CMD_NAV_LAND);
+			break;
+
+		case Phase::Done:
+			RCLCPP_INFO(get_logger(), "Mission complete!");
+			break;
+			
+		default:
+			break;
+	}
+}
+
+void VelocitySetpointControl::update_waypoints()
+{
+	if (!position_valid_ || !reached(waypoints_[wp_index_])) {
+		hold_ticks_ = 0;
+		return;
+	}
+
+	if (++hold_ticks_ < kHoldTicks) {
+		return;
+	}
+	hold_ticks_ = 0;
+
+	if (wp_index_ + 1 < waypoints_.size()) {
+		wp_index_++;
+		pid_.reset_integral_error();  // prevent windup carrying over to the next leg
+		RCLCPP_INFO(get_logger(), "Waypoint reached -> going to %zu", wp_index_);
+	} else {
+		RCLCPP_INFO(get_logger(), "Mission complete, landing!");
+		transition_to(Phase::Landing);
+	}
+}
+
+bool VelocitySetpointControl::reached(const Eigen::Vector3f & wp) const
+{
+	return (wp - pos_).norm() < kAcceptanceRadius;
+}
+
 void VelocitySetpointControl::arm()
 {
-	publish_vehicle_command(VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0);
-
-	RCLCPP_INFO(this->get_logger(), "Arm command send");
+	publish_vehicle_command(VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0f);
+	RCLCPP_INFO(get_logger(), "Arm command sent");
 }
 
-/**
- * @brief Send a command to Disarm the vehicle
- */
 void VelocitySetpointControl::disarm()
 {
-	publish_vehicle_command(VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0);
-
-	RCLCPP_INFO(this->get_logger(), "Disarm command send");
+	publish_vehicle_command(VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 0.0f);
+	RCLCPP_INFO(get_logger(), "Disarm command sent");
 }
 
-/**
- * @brief Publish the offboard control mode.
- *        For this example, only position and altitude controls are active.
- */
+uint64_t VelocitySetpointControl::now_us() const
+{
+	return now().nanoseconds() / 1000;
+}
+
 void VelocitySetpointControl::publish_offboard_control_mode()
 {
 	OffboardControlMode msg{};
@@ -184,75 +171,40 @@ void VelocitySetpointControl::publish_offboard_control_mode()
 	msg.acceleration = false;
 	msg.attitude = false;
 	msg.body_rate = false;
-	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-	offboard_control_mode_publisher_->publish(msg);
+	msg.timestamp = now_us();
+	offboard_control_mode_pub_->publish(msg);
 }
 
-/**
- * @brief Publish a trajectory setpoint
- *        For this example, it sends a trajectory setpoint to make the
- *        vehicle hover at 5 meters with a yaw angle of 180 degrees.
- */
-void VelocitySetpointControl::publish_trajectory_setpoint(const std::array<float, 3> &wp)
-{		
-	const uint64_t now_us = this->get_clock()->now().nanoseconds() / 1000;
-	float dt = (last_us_ == 0) ? 0.1f : static_cast<float>(now_us - last_us_) * 1e-6f;
+void VelocitySetpointControl::publish_velocity_setpoint(const Eigen::Vector3f & wp)
+{
+	const uint64_t t_us = now_us();
+	float dt = (last_us_ == 0) ? 0.1f : static_cast<float>(t_us - last_us_) * 1e-6f;
 	dt = std::clamp(dt, 0.001f, 0.5f);
-	const float nan = std::numeric_limits<float>::quiet_NaN();
-	static constexpr float kKp = 2.8f;
-	static constexpr float kKi = 0.1f;
-	static constexpr float kKd = 1.5f;
-	static constexpr float kV_max = 4.0f;
-	static constexpr float kI_max = 0.5f;
-	const std::array<float ,3> err{wp[0] - current_pos_[0], wp[1] - current_pos_[1], wp[2] - current_pos_[2]};
-	
-	std::array<float, 3> v_raw;
-	
-	// Calculate PID control outputs
-	for (int i = 0; i < 3; ++i) {
-		v_raw[i] = kKp * err[i] + std::clamp(kKi * cumulated_err_[i], -kI_max, kI_max) + kKd * (-current_vel_[i]);
-	}
-	std::array<float, 3> v_sp = v_raw;
-	const float n = std::hypot(v_raw[0], v_raw[1], v_raw[2]);
-	
-	// Clamp the velocity control output if saturated (v > v_max)
-	const bool saturated = n > kV_max;
-	if (saturated) {
-		RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 1000, "v_sp saturated: |v_ra|=%.2f > %.2f", n, kV_max);
-		for (auto &elem : v_sp) elem *= kV_max / n;
+	last_us_ = t_us;
+
+	const Eigen::Vector3f err = wp - pos_;
+	const PidOutput out = pid_.update(err, vel_, dt);
+
+	if (out.saturated) {
+		RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 1000, "v_sp saturated, scaled to |v|=%.2f",
+			out.velocity.norm());
 	}
 
-	// Stop integrating while saturation and moving
-	for (int i = 0; i < 3; ++i) {
-		const bool pushes_further = saturated && (err[i] * v_raw[i] > 0.0f);
-		if (!pushes_further) {
-			cumulated_err_[i] += err[i] * dt;
-		}
-	}
-
-	const float horiz_dist = std::hypot(err[0], err[1]);
-
-	last_us_ = now_us;
-	
+	// Face the direction of travel; hold the last heading when close to the waypoint
+	const float horiz_dist = std::hypot(err.x(), err.y());
 	if (horiz_dist > 0.5f || std::isnan(yaw_sp_)) {
-		yaw_sp_ = std::atan2(err[1], err[0]);
+		yaw_sp_ = std::atan2(err.y(), err.x());
 	}
-	
-	
+
+	const float nan = std::numeric_limits<float>::quiet_NaN();
 	TrajectorySetpoint msg{};
 	msg.position = {nan, nan, nan};
-	msg.velocity = {v_sp[0], v_sp[1], v_sp[2]};
-	msg.yaw = std::isnan(yaw_sp_) ? current_yaw_ : yaw_sp_;
-	msg.timestamp = now_us;
-	trajectory_setpoint_publisher_->publish(msg);
+	msg.velocity = {out.velocity.x(), out.velocity.y(), out.velocity.z()};
+	msg.yaw = std::isnan(yaw_sp_) ? yaw_ : yaw_sp_;
+	msg.timestamp = t_us;
+	trajectory_setpoint_pub_->publish(msg);
 }
 
-/**
- * @brief Publish vehicle commands
- * @param command   Command code (matches VehicleCommand and MAVLink MAV_CMD codes)
- * @param param1    Command parameter 1
- * @param param2    Command parameter 2
- */
 void VelocitySetpointControl::publish_vehicle_command(uint16_t command, float param1, float param2)
 {
 	VehicleCommand msg{};
@@ -264,17 +216,8 @@ void VelocitySetpointControl::publish_vehicle_command(uint16_t command, float pa
 	msg.source_system = 1;
 	msg.source_component = 1;
 	msg.from_external = true;
-	msg.timestamp = this->get_clock()->now().nanoseconds() / 1000;
-	vehicle_command_publisher_->publish(msg);
+	msg.timestamp = now_us();
+	vehicle_command_pub_->publish(msg);
 }
 
-int main(int argc, char *argv[])
-{
-	std::cout << "Starting velocity setpoints control node..." << std::endl;
-	setvbuf(stdout, NULL, _IONBF, BUFSIZ);
-	rclcpp::init(argc, argv);
-	rclcpp::spin(std::make_shared<VelocitySetpointControl>());
-
-	rclcpp::shutdown();
-	return 0;
-}
+}  // namespace autonomous_landing
