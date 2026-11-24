@@ -13,6 +13,7 @@ find_package(px4_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(Eigen3 REQUIRED NO_MODULE)
+find_package(X11 REQUIRED)
 
 # PID controller: pure math, no ROS dependency
 add_library(velocity_pid src/velocity_pid.cpp)
@@ -40,7 +41,13 @@ add_executable(camera_info_sync src/camera_info_sync.cpp)
 target_compile_features(camera_info_sync PUBLIC cxx_std_17)
 ament_target_dependencies(camera_info_sync "rclcpp" "sensor_msgs")
 
-install(TARGETS velocity_pid velocity_setpoint_control camera_info_sync
+# Keyboard teleop (reads global key state through X11)
+add_executable(keyboard_teleop src/keyboard_teleop.cpp)
+target_compile_features(keyboard_teleop PUBLIC cxx_std_17)
+target_link_libraries(keyboard_teleop X11::X11)
+ament_target_dependencies(keyboard_teleop "rclcpp" "px4_msgs")
+
+install(TARGETS velocity_pid velocity_setpoint_control camera_info_sync keyboard_teleop
   DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/
   DESTINATION include)
